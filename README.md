@@ -40,13 +40,11 @@ A powerful tool for extending AI capabilities through remote control, calculatio
 3. 填写相应的配置信息
 4. 点击"连接"按钮启动服务
 
-![MCP服务架构](doc_img/xiaozhi_mcp.png)
-
 ## 🔗 与 HyperChat 集成 | HyperChat Integration
 
 ### 1. 安装 HyperChat
 
-首先需要安装并运行 HyperChat 服务。HyperChat 是一个强大的 AI 对话平台，提供了丰富的插件和工具支持。
+首先需要安装并运行 [HyperChat](https://github.com/BigSweetPotatoStudio/HyperChat) 服务。HyperChat[HyperChat](https://github.com/BigSweetPotatoStudio/HyperChat) 是一个强大的 AI 对话平台，提供了丰富的插件和工具支持。
 
 ![HyperChat安装](doc_img/hyperchat_install.png.png)
 
@@ -71,6 +69,23 @@ A powerful tool for extending AI capabilities through remote control, calculatio
 完成配置后，您就可以启动服务，实现与 HyperChat 的连接：
 
 ![小智MCP连接](doc_img/mcp_services.png)
+![MCP服务架构](doc_img/xiaozhi_mcp.png)
+
+
+## 🔗 与 ModelScopeMCP 集成 | ModelScopeMCP Integration
+
+首先打开 [ModelScopeMCP](https://www.modelscope.cn/mcp) ，点击右上角进行注册登录，然后寻找标识为 **Hosted** 的应用，这些应用不需本地繁琐部署即可使用
+
+![image](https://github.com/user-attachments/assets/43cd3b48-3f10-4c3c-9a6d-21470783ee28)
+
+选择想要赋予小智的功能，点击进入MCP服务详情页面，点击右侧连接即可生成SSE连接，同 HyperChat 生成SSE一致，填入即可使用
+
+![image](https://github.com/user-attachments/assets/49868790-92b6-456d-8e73-6133e0312d9e)
+
+注意只复制 url 即可，由于SSE单向广播性质，请妥善保管自己的SSE通讯地址，否则别人也能收到你的广播内容
+
+![image](https://github.com/user-attachments/assets/2666cf9c-a433-496a-b127-f306bf1cfd1f)
+
 
 ## 🛠️ 配置说明 | Configuration
 
