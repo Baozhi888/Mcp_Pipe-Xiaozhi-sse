@@ -65,19 +65,29 @@ class ResponseQueue:
         self.tool_timeout = 300
         self._cleanup_task = None
         self._running = True
+        self._closed = False
         
     async def start(self):
         """Start the cleanup task"""
+        self._closed = False
+        self._running = True
         self._cleanup_task = asyncio.create_task(self._cleanup_loop())
         
     async def stop(self):
         """Stop the cleanup task"""
         self._running = False
+        self._closed = True
         if self._cleanup_task:
             self._cleanup_task.cancel()
             try:
                 await self._cleanup_task
             except asyncio.CancelledError:
+                pass
+        # Clear any remaining items
+        try:
+            while not self.queue.empty():
+                self.queue.get_nowait()
+        except asyncio.QueueEmpty:
                 pass
         
     async def add(self, message):
@@ -90,6 +100,8 @@ class ResponseQueue:
             asyncio.QueueFull: If queue is full and timeout occurs
             Exception: For other errors during queue operation
         """
+        if self._closed:
+            return
         try:
             await asyncio.wait_for(self.queue.put(message), timeout=10.0)
         except asyncio.QueueFull:
@@ -112,10 +124,13 @@ class ResponseQueue:
             asyncio.TimeoutError: If timeout occurs while waiting
             Exception: For other errors during queue operation
         """
+        if self._closed:
+            raise asyncio.CancelledError("Queue is closed")
         try:
-            return await asyncio.wait_for(self.queue.get(), timeout=30.0)
+            return await asyncio.wait_for(self.queue.get(), timeout=60.0)  # Increased timeout
         except asyncio.TimeoutError:
-            logger.warning("Timeout while getting message from queue")
+            if not self._closed:  # Only log warning if queue is not intentionally closed
+                logger.warning("Timeout while getting message from queue")
             raise
         except Exception as e:
             logger.error(f"Error getting message from queue: {e}")
@@ -212,6 +227,10 @@ async def connect_to_server(uri, target, mode='stdio'):
     """Connect to WebSocket server and establish bidirectional communication with target"""
     global reconnect_attempt, backoff, response_queue
     
+    # Ensure old response queue is properly cleaned up
+    if response_queue:
+        await response_queue.stop()
+    
     response_queue = ResponseQueue()
     logger.info("Response queue re-initialized for new connection.")
     
@@ -233,56 +252,63 @@ async def connect_to_server(uri, target, mode='stdio'):
             
             response_processor = asyncio.create_task(process_response_queue(websocket))
             
-            if mode == 'stdio':
-                process = subprocess.Popen(
-                    ['python', target],
-                    stdin=subprocess.PIPE,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    text=True,
-                    encoding='utf-8',
-                    errors='replace'
-                )
-                logger.info(f"Started {target} process")
-                
-                await asyncio.gather(
-                    pipe_websocket_to_process(websocket, process),
-                    pipe_process_to_queue(process),
-                    pipe_process_stderr_to_terminal(process),
-                    response_processor
-                )
-            elif mode == 'sse':
-                logger.info(f"Starting SSE mode with endpoint: {target}")
-                
-                async with aiohttp.ClientSession() as session:
-                    try:
-                        async with session.get(target) as sse_response:
-                            if sse_response.status != 200:
-                                logger.error(f"Failed to connect to SSE endpoint: {sse_response.status}")
-                                return
+            try:
+                if mode == 'stdio':
+                    process = subprocess.Popen(
+                        ['python', target],
+                        stdin=subprocess.PIPE,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        text=True,
+                        encoding='utf-8',
+                        errors='replace'
+                    )
+                    logger.info(f"Started {target} process")
+                    
+                    await asyncio.gather(
+                        pipe_websocket_to_process(websocket, process),
+                        pipe_process_to_queue(process),
+                        pipe_process_stderr_to_terminal(process),
+                        response_processor
+                    )
+                elif mode == 'sse':
+                    logger.info(f"Starting SSE mode with endpoint: {target}")
+                    
+                    async with aiohttp.ClientSession() as session:
+                        try:
+                            async with session.get(target) as sse_response:
+                                if sse_response.status != 200:
+                                    logger.error(f"Failed to connect to SSE endpoint: {sse_response.status}")
+                                    return
+                                    
+                                logger.info("Connected to SSE endpoint successfully")
                                 
-                            logger.info("Connected to SSE endpoint successfully")
-                            
-                            base_url = target.split('/sse')[0]
-                            
-                            await asyncio.gather(
-                                pipe_websocket_to_sse(websocket, session, base_url),
-                                pipe_sse_to_websocket(sse_response, websocket),
-                                response_processor
-                            )
-                    except Exception as e:
-                        logger.error(f"SSE connection error: {e}")
-                        raise
-            elif mode == 'streamable_http':
-                logger.info(f"Starting Streamable HTTP mode with endpoint: {target}")
-                
-                # Create aiohttp session
-                async with aiohttp.ClientSession() as session:
-                    await pipe_streamable_http(websocket, session, target)
-            else:
-                logger.error(f"Unsupported mode: {mode}")
-                response_processor.cancel()
-                return
+                                base_url = target.split('/sse')[0]
+                                
+                                await asyncio.gather(
+                                    pipe_websocket_to_sse(websocket, session, base_url),
+                                    pipe_sse_to_websocket(sse_response, websocket),
+                                    response_processor
+                                )
+                        except Exception as e:
+                            logger.error(f"SSE connection error: {e}")
+                            raise
+                elif mode == 'streamable_http':
+                    logger.info(f"Starting Streamable HTTP mode with endpoint: {target}")
+                    
+                    async with aiohttp.ClientSession() as session:
+                        await pipe_streamable_http(websocket, session, target)
+                else:
+                    logger.error(f"Unsupported mode: {mode}")
+                    response_processor.cancel()
+                    return
+            finally:
+                if response_processor and not response_processor.done():
+                    response_processor.cancel()
+                    try:
+                        await response_processor
+                    except asyncio.CancelledError:
+                        pass
     except websockets.exceptions.ConnectionClosed as e:
         logger.error(f"WebSocket connection closed: {e}")
         raise
@@ -592,17 +618,12 @@ async def pipe_streamable_http(websocket, session, base_url):
                 
     async def process_requests(current_endpoint_key):
         """处理请求队列中的消息，发送HTTP POST并处理流式响应的协程"""
-        nonlocal session_id 
-
-        while True:
+        nonlocal session_id
+        active_requests = set()
+        
+        async def handle_single_request(message):
+            nonlocal session_id  # 确保在内部函数中也可以访问session_id
             try:
-                message = await request_queue.get()
-                if message is None: 
-                    break
-
-                logger.debug(f"SHTTP: Processing message from request_queue: {message[:100]}...")
-                
-                
                 try:
                     msg_data = json.loads(message)
                     if ('method' in msg_data and msg_data['method'] == 'tools/call' and 
@@ -612,187 +633,177 @@ async def pipe_streamable_http(websocket, session, base_url):
                         response_queue.register_tool_request(request_id, tool_name)
                         logger.info(f"SHTTP: Routing tool '{tool_name}' to Streamable HTTP handler")
                 except json.JSONDecodeError:
-                    
                     logger.warning("SHTTP: Failed to parse WebSocket message as JSON for tool registration")
 
-                try:
-                    headers = {
-                        "Content-Type": "application/json",
-                        "Accept": "application/json, text/event-stream"
-                    }
-                    
-                    if session_id:
-                        headers["Mcp-Session-Id"] = session_id
-                    
-
-                    last_id_for_header = shttp_last_event_ids.get(current_endpoint_key)
-                    if last_id_for_header:
-                        is_resumable_message_type = False
-                        try:
-                            parsed_msg_for_resume_check = json.loads(message)
-                            if parsed_msg_for_resume_check.get("method") not in ["tools/list", "ping", "initialize", "session/terminate"]:
-                                 is_resumable_message_type = True
-                        except Exception: 
-                             pass
-                        
-                        if is_resumable_message_type:
-                            headers["Last-Event-ID"] = last_id_for_header
-                            logger.info(f"SHTTP: Sending message with Last-Event-ID: {last_id_for_header} for {current_endpoint_key}")
-   
-                    
-                    data_to_send = message if isinstance(message, str) else message.decode('utf-8')
-                    if not data_to_send.startswith('{'): 
-                        data_to_send = json.dumps({"message": data_to_send}) 
-                    
-                    logger.info(f"SHTTP: Sending POST to: {current_endpoint_key}")
-                    async with session.post(current_endpoint_key, data=data_to_send, headers=headers) as response:
-                        if response.status not in [200, 202]:
-                            error_text = await response.text()
-                            logger.error(f"SHTTP: Server error {response.status} for {current_endpoint_key}: {error_text}")
-                            if response.status == 4004: 
-                                logger.error("SHTTP: Server internal error (4004), closing WebSocket connection")
-                                await websocket.close(code=4004, reason="Server internal error (4004) from SHTTP POST")
-                                
-                            continue 
-                        if 'Mcp-Session-Id' in response.headers: 
-                            new_session_id = response.headers['Mcp-Session-Id']
-                            if new_session_id != session_id:
-                                session_id = new_session_id
-                                logger.info(f"SHTTP: Updated Mcp-Session-Id to: {session_id}")
-                        
-                        logger.info(f"SHTTP: Successfully sent message and received response from: {current_endpoint_key}")
-                        
-                        
-                        response_content_buffer = ""
-                        try:
-                            async for line_bytes in response.content:
-                                line_str = line_bytes.decode('utf-8')
-                                response_content_buffer += line_str
-                                
-                                while '\n\n' in response_content_buffer:
-                                    event_block, response_content_buffer = response_content_buffer.split('\n\n', 1)
-                                    
-                                    if event_block.strip():
-                                        current_event_id_from_block = None
-                                        data_lines_from_block = []
-
-                                        for event_line in event_block.split('\n'):
-                                            stripped_event_line = event_line.strip()
-                                            if stripped_event_line.startswith('id:'):
-                                                _id = stripped_event_line[3:].strip()
-                                                if _id:
-                                                    current_event_id_from_block = _id
-                                            elif stripped_event_line.startswith('data:'):
-                                                data_lines_from_block.append(stripped_event_line[5:].strip())
-                                        
-                                        if current_event_id_from_block:
-                                            shttp_last_event_ids[current_endpoint_key] = current_event_id_from_block
-                                            logger.info(f"SHTTP: Extracted and updated Last-Event-ID to: {current_event_id_from_block} for {current_endpoint_key}")
-                                        
-                                        if data_lines_from_block:
-                                            full_data_from_event = "\n".join(data_lines_from_block)
-                                            try:
-                                                
-                                                json_check_data = json.loads(full_data_from_event)
-                                                if 'error' in json_check_data:
-                                                    logger.error(f"SHTTP: Server returned error in stream: {json_check_data['error']}")
-                                                    if json_check_data.get('code') == 4004:
-                                                        await websocket.close(code=4004, reason=str(json_check_data['error']))
-                                                        return 
-                                                
-                                                await response_queue.add(full_data_from_event)
-                                                logger.debug(f"SHTTP: Added data to response_queue: {full_data_from_event[:100]}...")
-                                            except json.JSONDecodeError:
-                                                logger.warning(f"SHTTP: Streamed data is not JSON, adding as is: {full_data_from_event[:100]}...")
-                                                await response_queue.add(full_data_from_event) 
-                                            except Exception as e_add_q:
-                                                logger.error(f"SHTTP: Error adding to response_queue: {e_add_q}")
-                        except asyncio.CancelledError:
-                            logger.info("SHTTP: Streaming response handling cancelled.")
-                            break 
-                        except Exception as e_stream:
-                            logger.error(f"SHTTP: Error reading streaming response: {e_stream}")
-                            if '4004' in str(e_stream): 
-                                await websocket.close(code=4004, reason="Server streaming error with 4004")
-                                return 
-                            continue
-
-                except aiohttp.ClientError as e_http: 
-                    logger.error(f"SHTTP: HTTP Client Error sending message to {current_endpoint_key}: {e_http}")
-                    
-                    if isinstance(e_http, aiohttp.ClientConnectionError):
-                        logger.warning(f"SHTTP: Connection error, may trigger WebSocket reconnect via main loop's exception handling.")
-                        
-                        raise 
-                    continue
-                except Exception as e_send:
-                    logger.error(f"SHTTP: Generic error sending message or processing its response for {current_endpoint_key}: {e_send}")
-                    if '4004' in str(e_send):
-                        await websocket.close(code=4004, reason="Server connection error (generic with 4004)")
-                        return 
-                    continue 
-            
-            except asyncio.CancelledError:
-                logger.info("SHTTP: process_requests task was cancelled.")
-                break 
-            except Exception as e_outer_loop: 
-                logger.error(f"SHTTP: Unhandled error in process_requests main loop: {e_outer_loop}")
+                headers = {
+                    "Content-Type": "application/json",
+                    "Accept": "application/json, text/event-stream"
+                }
                 
-                await asyncio.sleep(1) 
+                if session_id:
+                    headers["Mcp-Session-Id"] = session_id
+                    logger.debug(f"SHTTP: Using session ID: {session_id}")
+                else:
+                    logger.warning("SHTTP: No session ID available for request")
+
+                last_id_for_header = shttp_last_event_ids.get(current_endpoint_key)
+                if last_id_for_header:
+                    try:
+                        parsed_msg = json.loads(message)
+                        if parsed_msg.get("method") not in ["tools/list", "ping", "initialize", "session/terminate"]:
+                            headers["Last-Event-ID"] = last_id_for_header
+                            logger.info(f"SHTTP: Sending message with Last-Event-ID: {last_id_for_header}")
+                    except Exception:
+                        pass
+
+                data_to_send = message if isinstance(message, str) else message.decode('utf-8')
+                if not data_to_send.startswith('{'): 
+                    data_to_send = json.dumps({"message": data_to_send})
+
+                logger.info(f"SHTTP: Sending POST to: {current_endpoint_key}")
+                async with session.post(current_endpoint_key, data=data_to_send, headers=headers) as response:
+                    if response.status not in [200, 202]:
+                        error_text = await response.text()
+                        logger.error(f"SHTTP: Server error {response.status}: {error_text}")
+                        if response.status == 4004:
+                            await websocket.close(code=4004, reason="Server internal error (4004)")
+                        return
+
+                    new_session_id = response.headers.get('Mcp-Session-Id')
+                    if new_session_id:
+                        session_id = new_session_id
+                        logger.info(f"SHTTP: Updated Mcp-Session-Id to: {session_id}")
+                    elif not session_id:
+                        logger.warning("SHTTP: Still no session ID after request")
+
+                    logger.info(f"SHTTP: Successfully sent message and received response")
+                    
+                    response_content_buffer = ""
+                    async for line_bytes in response.content:
+                        line_str = line_bytes.decode('utf-8')
+                        response_content_buffer += line_str
+                        
+                        while '\n\n' in response_content_buffer:
+                            event_block, response_content_buffer = response_content_buffer.split('\n\n', 1)
+                            if not event_block.strip():
+                                continue
+                                
+                            current_event_id = None
+                            data_lines = []
+                            
+                            for event_line in event_block.split('\n'):
+                                line = event_line.strip()
+                                if line.startswith('id:'):
+                                    current_event_id = line[3:].strip()
+                                elif line.startswith('data:'):
+                                    data_lines.append(line[5:].strip())
+                                    
+                            if current_event_id:
+                                shttp_last_event_ids[current_endpoint_key] = current_event_id
+                                
+                            if data_lines:
+                                full_data = '\n'.join(data_lines)
+                                try:
+                                    json_data = json.loads(full_data)
+                                    if 'error' in json_data:
+                                        logger.error(f"SHTTP: Server error in stream: {json_data['error']}")
+                                        if json_data.get('code') == 4004:
+                                            await websocket.close(code=4004, reason=str(json_data['error']))
+                                            return
+                                            
+                                    await response_queue.add(full_data)
+                                except json.JSONDecodeError:
+                                    await response_queue.add(full_data)
+                                except Exception as e:
+                                    logger.error(f"SHTTP: Error processing response: {e}")
+
+            except asyncio.CancelledError:
+                logger.info("SHTTP: Request handling cancelled")
+                raise
+            except Exception as e:
+                logger.error(f"SHTTP: Error handling request: {e}")
+                if '4004' in str(e):
+                    await websocket.close(code=4004, reason="Server error (4004)")
+                    raise
+        
+        while True:
+            try:
+                message = await request_queue.get()
+                if message is None:
+                    break
+                    
+                # 清理已完成的请求
+                active_requests = {task for task in active_requests if not task.done()}
+                
+                # 创建新的请求处理任务
+                task = asyncio.create_task(handle_single_request(message))
+                active_requests.add(task)
+                
+            except asyncio.CancelledError:
+                logger.info("SHTTP: Process requests task cancelled")
+                break
+            except Exception as e:
+                logger.error(f"SHTTP: Error in main request loop: {e}")
+                await asyncio.sleep(1)
                 continue
-    
-    request_handler_task = None 
-    request_processor_task = None
-    
+                
+        # 等待所有活跃请求完成
+        if active_requests:
+            await asyncio.gather(*active_requests, return_exceptions=True)
 
     try:
-        endpoint = base_url.rstrip('/') 
+        endpoint = base_url.rstrip('/')
         logger.info(f"SHTTP: Mode starting with target endpoint: {endpoint}")
         
-        
-        session_id = await initialize_session(session, endpoint) 
+        # 初始化session并获取session_id
+        session_id = await initialize_session(session, endpoint)
         if session_id:
             logger.info(f"SHTTP: Initialized with Mcp-Session-Id: {session_id}")
         else:
             logger.warning("SHTTP: No Mcp-Session-Id received from initialize_session.")
+            # 继续执行，因为某些请求可能不需要session_id
         
-        
-        http_heartbeat_task = asyncio.create_task(send_heartbeat(session, endpoint, session_id))
+        # Callable to get the current session_id for heartbeat
+        def get_shttp_session_id():
+            return session_id
+
+        http_heartbeat_task = asyncio.create_task(
+            send_heartbeat(session, endpoint, get_shttp_session_id)
+        )
         ws_heartbeat_task = asyncio.create_task(websocket_heartbeat(websocket))
         
         request_handler_task = asyncio.create_task(handle_requests())
-        request_processor_task = asyncio.create_task(process_requests(endpoint)) 
+        request_processor_task = asyncio.create_task(process_requests(endpoint))
         
         done, pending = await asyncio.wait(
             [request_handler_task, request_processor_task],
             return_when=asyncio.FIRST_COMPLETED,
         )
 
-        for task in done: 
+        for task in done:
             if task.exception():
                 logger.error(f"SHTTP: A critical SHTTP task failed: {task.exception()}")
-                raise task.exception() 
+                raise task.exception()
 
-    except websockets.exceptions.ConnectionClosedError as e_ws_closed: 
+    except websockets.exceptions.ConnectionClosedError as e_ws_closed:
         logger.error(f"SHTTP: WebSocket connection closed during operation: {e_ws_closed}")
         if e_ws_closed.code == 4004:
             logger.error("SHTTP: WebSocket closed due to 4004, will be retried by main loop.")
-        raise 
-    except Exception as e_main_shttp: 
+        raise
+    except Exception as e_main_shttp:
         logger.error(f"SHTTP: Main error in pipe_streamable_http: {e_main_shttp}")
-        raise 
-        
+        raise
     finally:
         logger.info("SHTTP: pipe_streamable_http is finishing or being cleaned up.")
         if request_queue and request_processor_task and not request_processor_task.done():
-             await request_queue.put(None) 
+            await request_queue.put(None)
 
         tasks_to_cancel = [http_heartbeat_task, ws_heartbeat_task, request_handler_task, request_processor_task]
         for task in tasks_to_cancel:
             if task and not task.done():
                 task.cancel()
                 try:
-                    await task 
+                    await task
                 except asyncio.CancelledError:
                     logger.info(f"SHTTP: Task {task.get_name()} was cancelled successfully.")
                 except Exception as e_cancel:
@@ -845,7 +856,7 @@ async def initialize_session(session, endpoint):
         logger.error(f"Error initializing session: {e}")
         return None
 
-async def send_heartbeat(session, endpoint, session_id=None):
+async def send_heartbeat(session, endpoint, session_id_or_callable=None):
     """Send periodic heartbeat to keep connection alive"""
     try:
         logger.info(f"Started heartbeat task to {endpoint}")
@@ -854,9 +865,6 @@ async def send_heartbeat(session, endpoint, session_id=None):
             "Content-Type": "application/json",
             "Accept": "application/json, text/event-stream"
         }
-        
-        if session_id:
-            headers["Mcp-Session-Id"] = session_id
             
         data = json.dumps({
             "jsonrpc": "2.0",
@@ -865,40 +873,57 @@ async def send_heartbeat(session, endpoint, session_id=None):
         })
         
         while True:
-            await asyncio.sleep(20)
-            try:
-                if session_id and session_id != headers.get("Mcp-Session-Id"):
-                    headers["Mcp-Session-Id"] = session_id
+            await asyncio.sleep(20) # Standard 20-second interval for heartbeats
+
+            current_session_id = None
+            if callable(session_id_or_callable):
+                current_session_id = session_id_or_callable()
+            elif session_id_or_callable is not None:
+                current_session_id = session_id_or_callable
+
+            # Prepare headers for the current heartbeat
+            current_headers = headers.copy()
+            if current_session_id:
+                current_headers["Mcp-Session-Id"] = current_session_id
+            else:
+                # Ensure Mcp-Session-Id is not sent if no session_id is available
+                current_headers.pop("Mcp-Session-Id", None)
                     
-                logger.debug(f"Sending heartbeat to {endpoint}")
-                async with session.post(endpoint, data=data, headers=headers) as response:
+            try:
+                logger.debug(f"Sending heartbeat to {endpoint} with session_id: {current_session_id}")
+                async with session.post(endpoint, data=data, headers=current_headers) as response:
                     if response.status in [200, 202]:
                         logger.debug(f"Heartbeat successful: {response.status}")
-                        if 'Mcp-Session-Id' in response.headers:
-                            new_session_id = response.headers['Mcp-Session-Id']
-                            if new_session_id != session_id:
-                                session_id = new_session_id
-                                logger.info(f"Updated session ID from heartbeat: {session_id}")
+                        # Heartbeat should not be authoritative for changing session_id.
+                        # Session ID updates should come from the main request/response flow
+                        # or initialization. So, we don't update session_id from heartbeat response here.
                     else:
                         response_text = await response.text()
                         logger.warning(f"Heartbeat failed: {response.status} - {response_text}")
-                        if response.status == 4004:
-                            logger.error("Server internal error (4004) during heartbeat")
+                        if response.status == 4004: # Specific error code indicating potential session invalidation
+                            logger.error("Server internal error (4004) during heartbeat, likely session terminated.")
+                            # Propagate an error that could trigger reconnection or session re-initialization
                             raise websockets.exceptions.ConnectionClosedError(
-                                4004, "Server internal error during heartbeat"
+                                4004, "Server internal error during heartbeat (session may be invalid)"
                             )
+            except aiohttp.ClientError as e: # More specific exception handling for network issues
+                logger.warning(f"Error sending heartbeat (network issue): {e}")
+                # Depending on the error, this might lead to the main connection retry logic
+                # if the connection is indeed broken.
+            except websockets.exceptions.ConnectionClosedError: # Re-raise if it's a specific close error
+                raise
             except Exception as e:
-                logger.warning(f"Error sending heartbeat: {e}")
-                if 'code' in str(e) and '4004' in str(e):
-                    raise websockets.exceptions.ConnectionClosedError(
-                        4004, "Server internal error during heartbeat"
-                    )
+                logger.warning(f"Generic error sending heartbeat: {e}")
+                # Avoid crashing the heartbeat loop for non-fatal errors, but log them.
+                # If the error implies a closed connection (e.g., from response.status == 4004 logic),
+                # it should be re-raised to be caught by the main connection handler.
+
     except asyncio.CancelledError:
-        logger.info("Heartbeat task cancelled")
-        raise
-    except Exception as e:
-        logger.error(f"Fatal error in heartbeat task: {e}")
-        raise
+        logger.info(f"Heartbeat task to {endpoint} cancelled")
+        raise # Ensure cancellation propagates
+    except Exception as e: # Catch-all for the outer loop of send_heartbeat
+        logger.error(f"Fatal error in heartbeat task to {endpoint}: {e}")
+        raise # Re-raise to ensure the main connection logic can react
 
 async def websocket_heartbeat(websocket):
     """Keep WebSocket connection alive with ping/pong"""
