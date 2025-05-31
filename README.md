@@ -40,7 +40,7 @@ A powerful tool for extending AI capabilities through remote control, calculatio
 3. 填写相应的配置信息
 4. 点击"连接"按钮启动服务
 
-![MCP服务架构](doc_img/mcp_services.png)
+![MCP服务架构](doc_img/xiaozhi_mcp.png)
 
 ## 🔗 与 HyperChat 集成 | HyperChat Integration
 
@@ -70,7 +70,7 @@ A powerful tool for extending AI capabilities through remote control, calculatio
 
 完成配置后，您就可以启动服务，实现与 HyperChat 的连接：
 
-![小智MCP连接](doc_img/xiaozhi_mcp.png)
+![小智MCP连接](doc_img/mcp_services.png)
 
 ## 🛠️ 配置说明 | Configuration
 
