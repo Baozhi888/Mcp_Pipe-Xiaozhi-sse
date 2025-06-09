@@ -1229,6 +1229,9 @@ async def send_heartbeat(session, endpoint, session_id_or_callable=None):
                 async with session.post(endpoint, data=data, headers=current_headers) as response:
                     if response.status in [200, 202]:
                         logger.debug(f"Heartbeat successful: {response.status}")
+                        # Heartbeat should not be authoritative for changing session_id.
+                        # Session ID updates should come from the main request/response flow
+                        # or initialization. So, we don't update session_id from heartbeat response here.
                     else:
                         response_text = await response.text()
                         logger.warning(f"Heartbeat failed: {response.status} - {response_text}")
@@ -1246,6 +1249,9 @@ async def send_heartbeat(session, endpoint, session_id_or_callable=None):
                 raise
             except Exception as e:
                 logger.warning(f"Generic error sending heartbeat: {e}")
+                # Avoid crashing the heartbeat loop for non-fatal errors, but log them.
+                # If the error implies a closed connection (e.g., from response.status == 4004 logic),
+                # it should be re-raised to be caught by the main connection handler.
 
     except asyncio.CancelledError:
         logger.info(f"Heartbeat task to {endpoint} cancelled")
