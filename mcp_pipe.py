@@ -1,4 +1,19 @@
 """
+===============================================================================
+MCP Tools Connector for Xiaozhi AI Assistant
+===============================================================================
+
+Copyright (c) 2025 PonYoung（旷）
+All rights reserved.
+
+Repository: https://github.com/onepy/Mcp_Pipe-Xiaozhi-All
+Author: PonYoung（旷）
+License: MIT License
+
+This is open source software licensed under the MIT License.
+See the LICENSE file in the project root for full license terms.
+
+===============================================================================
 This script is used to connect to the MCP server and pipe the input and output to the websocket endpoint.
 Version: 0.3.0
 Author: PonYoung
@@ -51,6 +66,218 @@ backoff = INITIAL_BACKOFF
 
 shttp_last_event_ids = {}
 
+# 工具响应大小限制（字节数）
+tool_result_limit = 8192
+
+def truncate_tool_response(response_data, limit=None):
+    """截断工具响应以防止超出MCP接入点限制
+
+    Args:
+        response_data: 响应数据（字符串或字典）
+        limit: 字节数限制，如果为None则使用全局设置，0表示不截断
+
+    Returns:
+        截断后的响应数据
+    """
+    if limit is None:
+        limit = tool_result_limit
+
+    # 如果限制为0，表示不截断
+    if limit == 0:
+        return response_data
+
+    try:
+        # 如果是字符串，直接处理
+        if isinstance(response_data, str):
+            response_bytes = response_data.encode('utf-8')
+            if len(response_bytes) <= limit:
+                return response_data
+
+            # 尝试智能截断：如果是JSON，尝试保持结构完整
+            try:
+                json_data = json.loads(response_data)
+                return _truncate_json_response(json_data, response_data, limit)
+            except json.JSONDecodeError:
+                # 不是JSON，直接按字节截断
+                return _truncate_by_bytes(response_data, limit)
+
+        # 如果是JSON数据，尝试解析并处理
+        if isinstance(response_data, dict):
+            response_str = json.dumps(response_data, ensure_ascii=False, indent=2)
+        else:
+            response_str = str(response_data)
+
+        response_bytes = response_str.encode('utf-8')
+        if len(response_bytes) <= limit:
+            return response_data  # 返回原始数据
+
+        # 需要截断，返回截断后的字符串
+        return _truncate_json_response(response_data, response_str, limit)
+
+    except Exception as e:
+        logger.warning(f"截断响应时出错: {e}")
+        # 出错时返回原始数据
+        return response_data
+
+def _truncate_by_bytes(text, byte_limit):
+    """按字节数截断文本，确保不破坏UTF-8字符"""
+    try:
+        text_bytes = text.encode('utf-8')
+        if len(text_bytes) <= byte_limit:
+            return text
+
+        # 预留空间给截断提示信息
+        truncation_msg = f"\n\n[响应已截断，原大小: {len(text_bytes)} 字节，显示前 {byte_limit} 字节]"
+        truncation_msg_bytes = truncation_msg.encode('utf-8')
+        available_bytes = byte_limit - len(truncation_msg_bytes)
+
+        if available_bytes <= 0:
+            # 如果连截断信息都放不下，只返回简单信息
+            simple_msg = "[响应过大已截断]"
+            return simple_msg
+
+        # 按字节截断，但要确保不破坏UTF-8字符
+        truncated_bytes = text_bytes[:available_bytes]
+
+        # 向后查找完整的UTF-8字符边界
+        while len(truncated_bytes) > 0:
+            try:
+                truncated_text = truncated_bytes.decode('utf-8')
+                return truncated_text + truncation_msg
+            except UnicodeDecodeError:
+                # 如果解码失败，说明截断位置在UTF-8字符中间，向前移动一个字节
+                truncated_bytes = truncated_bytes[:-1]
+
+        # 如果都无法解码，返回简单信息
+        return "[响应过大已截断]"
+
+    except Exception:
+        return text  # 出错时返回原文
+
+def _truncate_json_response(json_data, response_str, byte_limit):
+    """智能截断JSON响应，尝试保持结构完整，最大化利用字节限制"""
+    try:
+        # 如果是工具响应，尝试只截断内容部分
+        if isinstance(json_data, dict) and 'result' in json_data:
+            result = json_data['result']
+            if isinstance(result, dict) and 'content' in result:
+                content = result['content']
+                if isinstance(content, list) and len(content) > 0:
+                    # 截断第一个内容项的文本
+                    first_content = content[0]
+                    if isinstance(first_content, dict) and 'text' in first_content:
+                        original_text = first_content['text']
+                        original_text_bytes = original_text.encode('utf-8')
+
+                        # 使用二分查找来找到最大可用的文本长度
+                        return _binary_search_truncate(json_data, original_text, byte_limit)
+
+        # 如果不是标准工具响应格式，使用简单字节截断
+        return _truncate_by_bytes(response_str, byte_limit)
+
+    except Exception:
+        # 智能截断失败，使用简单字节截断
+        return _truncate_by_bytes(response_str, byte_limit)
+
+def _binary_search_truncate(json_data, original_text, byte_limit):
+    """使用二分查找找到最大可用的文本长度，最大化利用字节限制"""
+    try:
+        original_text_bytes = original_text.encode('utf-8')
+
+        # 如果原文本很短，直接返回
+        if len(original_text_bytes) < 100:
+            return json.dumps(json_data, ensure_ascii=False, indent=2)
+
+        # 二分查找最大可用长度
+        left, right = 0, len(original_text)
+        best_result = None
+
+        while left <= right:
+            mid = (left + right) // 2
+
+            # 尝试截断到mid位置
+            test_text = original_text[:mid]
+            test_text_bytes = test_text.encode('utf-8')
+
+            # 添加截断提示
+            truncation_info = f"\n\n[内容已截断，原大小: {len(original_text_bytes)} 字节]"
+            test_text_with_info = test_text + truncation_info
+
+            # 创建测试JSON
+            test_json = json_data.copy()
+            test_json['result']['content'][0]['text'] = test_text_with_info
+
+            # 生成JSON字符串并检查大小
+            test_json_str = json.dumps(test_json, ensure_ascii=False, indent=2)
+            test_json_bytes = test_json_str.encode('utf-8')
+
+            if len(test_json_bytes) <= byte_limit:
+                # 这个长度可以，尝试更长的
+                best_result = test_json_str
+                left = mid + 1
+            else:
+                # 这个长度太长，尝试更短的
+                right = mid - 1
+
+        if best_result:
+            return best_result
+
+        # 如果二分查找失败，使用最小截断
+        min_text = original_text[:100] if len(original_text) > 100 else original_text
+        truncation_info = f"\n\n[内容已截断，原大小: {len(original_text_bytes)} 字节]"
+
+        fallback_json = json_data.copy()
+        fallback_json['result']['content'][0]['text'] = min_text + truncation_info
+
+        return json.dumps(fallback_json, ensure_ascii=False, indent=2)
+
+    except Exception:
+        # 如果所有智能截断都失败，使用简单截断
+        return _truncate_by_bytes(json.dumps(json_data, ensure_ascii=False, indent=2), byte_limit)
+
+def is_tool_response(data):
+    """判断是否为工具调用响应
+
+    Args:
+        data: 响应数据
+
+    Returns:
+        bool: 是否为工具响应
+    """
+    try:
+        if isinstance(data, str):
+            json_data = json.loads(data)
+        elif isinstance(data, dict):
+            json_data = data
+        else:
+            return False
+
+        # 检查是否包含工具调用结果
+        if ('result' in json_data and
+            'id' in json_data and
+            json_data.get('id') is not None and
+            'method' not in json_data):  # 排除方法调用
+
+            # 进一步检查：排除工具列表响应和其他系统响应
+            result = json_data.get('result', {})
+
+            # 如果result包含tools字段，这是工具列表响应，不应截断
+            if isinstance(result, dict) and 'tools' in result:
+                return False
+
+            # 如果result包含content字段，这很可能是工具调用响应
+            if isinstance(result, dict) and 'content' in result:
+                return True
+
+            # 如果result是字符串或其他简单类型，也可能是工具响应
+            if not isinstance(result, dict) or len(result) > 0:
+                return True
+
+        return False
+
+    except (json.JSONDecodeError, TypeError):
+        return False
+
 # 响应队列类
 class ResponseQueue:
     def __init__(self, maxsize=1000):
@@ -74,21 +301,40 @@ class ResponseQueue:
         self._cleanup_task = asyncio.create_task(self._cleanup_loop())
         
     async def stop(self):
-        """Stop the cleanup task"""
+        """Stop the cleanup task and close the queue"""
         self._running = False
         self._closed = True
+
+        # Cancel cleanup task first
         if self._cleanup_task:
             self._cleanup_task.cancel()
             try:
                 await self._cleanup_task
             except asyncio.CancelledError:
                 pass
-        # Clear any remaining items
+
+        # Clear existing queue items
         try:
             while not self.queue.empty():
-                self.queue.get_nowait()
-        except asyncio.QueueEmpty:
-                pass
+                try:
+                    self.queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+        except Exception:
+            pass
+
+        # Put a sentinel value to wake up any waiting get() operations
+        # This helps prevent TimeoutError in process_response_queue
+        try:
+            self.queue.put_nowait(None)  # Sentinel value
+        except asyncio.QueueFull:
+            pass  # Queue is full, but that's ok since we're closing
+        except Exception:
+            pass
+
+        # Clear tool requests
+        self.tool_requests.clear()
+        self.tool_request_timestamps.clear()
         
     async def add(self, message):
         """Add message to queue with timeout
@@ -116,21 +362,31 @@ class ResponseQueue:
         
     async def get(self):
         """Get message from queue with timeout
-        
+
         Returns:
             Message from queue
-            
+
         Raises:
+            asyncio.CancelledError: If queue is closed or cancelled
             asyncio.TimeoutError: If timeout occurs while waiting
             Exception: For other errors during queue operation
         """
         if self._closed:
             raise asyncio.CancelledError("Queue is closed")
         try:
-            return await asyncio.wait_for(self.queue.get(), timeout=60.0)  # Increased timeout
+            # Use shorter timeout and check closed state more frequently
+            return await asyncio.wait_for(self.queue.get(), timeout=10.0)
         except asyncio.TimeoutError:
-            if not self._closed:  # Only log warning if queue is not intentionally closed
-                logger.warning("Timeout while getting message from queue")
+            # Check if queue was closed during timeout
+            if self._closed:
+                raise asyncio.CancelledError("Queue was closed during wait")
+            # If not closed, this is a real timeout - log and re-raise
+            logger.warning("Timeout while getting message from queue")
+            raise
+        except asyncio.CancelledError:
+            # Mark as closed when cancelled to prevent further operations
+            self._closed = True
+            logger.info("Queue get operation was cancelled")
             raise
         except Exception as e:
             logger.error(f"Error getting message from queue: {e}")
@@ -254,6 +510,9 @@ async def connect_to_server(uri, target, mode='stdio'):
             
             try:
                 if mode == 'stdio':
+                    # 创建子进程时不显示控制台窗口
+                    creation_flags = subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
+                    
                     process = subprocess.Popen(
                         ['python', target],
                         stdin=subprocess.PIPE,
@@ -261,7 +520,8 @@ async def connect_to_server(uri, target, mode='stdio'):
                         stderr=subprocess.PIPE,
                         text=True,
                         encoding='utf-8',
-                        errors='replace'
+                        errors='replace',
+                        creationflags=creation_flags
                     )
                     logger.info(f"Started {target} process")
                     
@@ -303,12 +563,18 @@ async def connect_to_server(uri, target, mode='stdio'):
                     response_processor.cancel()
                     return
             finally:
+                # Cancel response processor first to prevent TimeoutError
                 if response_processor and not response_processor.done():
+                    logger.info("Cancelling response processor task")
                     response_processor.cancel()
                     try:
-                        await response_processor
+                        await asyncio.wait_for(response_processor, timeout=5.0)
                     except asyncio.CancelledError:
-                        pass
+                        logger.info("Response processor cancelled successfully")
+                    except asyncio.TimeoutError:
+                        logger.warning("Response processor cancellation timed out")
+                    except Exception as e:
+                        logger.warning(f"Error during response processor cancellation: {e}")
     except websockets.exceptions.ConnectionClosed as e:
         logger.error(f"WebSocket connection closed: {e}")
         raise
@@ -316,9 +582,16 @@ async def connect_to_server(uri, target, mode='stdio'):
         logger.error(f"Connection error: {e}")
         raise
     finally:
-        await response_queue.stop()
-        logger.info("Response queue cleanup task stopped.")
-        
+        # Stop response queue first to prevent further operations
+        logger.info("Stopping response queue...")
+        try:
+            await asyncio.wait_for(response_queue.stop(), timeout=5.0)
+            logger.info("Response queue stopped successfully")
+        except asyncio.TimeoutError:
+            logger.warning("Response queue stop operation timed out")
+        except Exception as e:
+            logger.error(f"Error stopping response queue: {e}")
+
         if mode == 'stdio' and 'process' in locals():
             logger.info(f"Terminating {target} process")
             try:
@@ -336,14 +609,21 @@ async def pipe_websocket_to_process(websocket, process):
             
             if isinstance(message, bytes):
                 message = message.decode('utf-8')
-            process.stdin.write(message + '\n')
-            process.stdin.flush()
+            try:
+                process.stdin.write(message + '\n')
+                process.stdin.flush()
+            except Exception as e:
+                logger.error(f"Error writing to process stdin: {e}")
+                raise
     except Exception as e:
         logger.error(f"Error in WebSocket to process pipe: {e}")
         raise
     finally:
         if not process.stdin.closed:
-            process.stdin.close()
+            try:
+                process.stdin.close()
+            except Exception as e:
+                logger.error(f"Error closing process stdin: {e}")
 
 async def pipe_process_to_queue(process):
     """Read data from process stdout and send to queue"""
@@ -357,8 +637,27 @@ async def pipe_process_to_queue(process):
                 logger.info("Process has ended output")
                 break
                 
-            # Send data to queue
-            await response_queue.add(data)
+            try:
+                # 检查是否为工具响应并应用截断
+                processed_data = data
+                try:
+                    if data.strip():  # 确保不是空行
+                        json_data = json.loads(data.strip())
+                        if is_tool_response(json_data):
+                            processed_data = truncate_tool_response(data)
+                            if tool_result_limit == 0:
+                                logger.info(f"STDIO: Tool response processed (truncation disabled)")
+                            else:
+                                logger.info(f"STDIO: Tool response truncated (limit: {tool_result_limit} bytes)")
+                except (json.JSONDecodeError, ValueError):
+                    # 不是JSON数据，保持原样
+                    pass
+
+                # Send data to queue
+                await response_queue.add(processed_data)
+            except Exception as e:
+                logger.error(f"Error adding data to queue: {e}")
+                raise
     except Exception as e:
         logger.error(f"Error in process to queue pipe: {e}")
         raise
@@ -375,8 +674,8 @@ async def pipe_process_stderr_to_terminal(process):
                 logger.info("Process has ended stderr output")
                 break
                 
-            sys.stderr.write(data)
-            sys.stderr.flush()
+            # 不再直接写入sys.stderr，而是使用logger记录
+            logger.warning(f"Process stderr: {data.strip()}")
     except Exception as e:
         logger.error(f"Error in process stderr pipe: {e}")
         raise
@@ -510,7 +809,15 @@ async def pipe_sse_to_websocket(sse_response, websocket):
                                 tool_name = response_queue.get_tool_request(response_id)
                                 if tool_name:
                                     logger.info(f"Received response for tool '{tool_name}'")
-                            
+
+                                    # 检查是否为工具响应并应用截断
+                                    if is_tool_response(data_obj):
+                                        actual_message = truncate_tool_response(actual_message)
+                                        if tool_result_limit == 0:
+                                            logger.info(f"Tool response for '{tool_name}' (truncation disabled)")
+                                        else:
+                                            logger.info(f"Tool response truncated for '{tool_name}' (limit: {tool_result_limit} bytes)")
+
                             await response_queue.add(actual_message)
                         except json.JSONDecodeError:
                             logger.warning(f"Received non-JSON message from SSE: {full_data[:50]}...")
@@ -540,8 +847,28 @@ async def process_response_queue(websocket):
     try:
         logger.info("Started response queue processor")
         while True:
-            response = await response_queue.get()
-            
+            try:
+                response = await response_queue.get()
+            except asyncio.CancelledError:
+                logger.info("Response queue get operation cancelled - stopping processor")
+                raise
+            except asyncio.TimeoutError:
+                # Check if we should continue or if connection is closing
+                if response_queue._closed:
+                    logger.info("Response queue closed during timeout - stopping processor")
+                    raise asyncio.CancelledError("Queue closed")
+                # Continue waiting for responses
+                continue
+            except Exception as e:
+                logger.error(f"Error getting response from queue: {e}")
+                # Don't break the loop for other errors, just continue
+                continue
+
+            # Check for sentinel value (None) indicating queue shutdown
+            if response is None:
+                logger.info("Received sentinel value - stopping response processor")
+                raise asyncio.CancelledError("Queue shutdown sentinel received")
+
             if isinstance(response, str):
                 if response.startswith('event:') or response.startswith('data:'):
                     try:
@@ -555,7 +882,7 @@ async def process_response_queue(websocket):
                     except Exception as e:
                         logger.warning(f"Error processing SSE data: {e}")
                         continue
-            
+
             response_type = "Unknown"
             try:
                 if isinstance(response, str) and response.startswith('{'):
@@ -573,10 +900,10 @@ async def process_response_queue(websocket):
                         response_type = "JSON data"
             except json.JSONDecodeError:
                 pass
-                
+
             logger.info(f"Sending to WebSocket: {response_type} ({len(response) if isinstance(response, str) else 'non-string'} bytes)")
             logger.debug(f"Response content: {response[:200]}..." if isinstance(response, str) and len(response) > 200 else response)
-            
+
             try:
                 await asyncio.wait_for(websocket.send(response), timeout=20.0)
             except websockets.exceptions.ConnectionClosed as e:
@@ -588,7 +915,7 @@ async def process_response_queue(websocket):
             except Exception as e:
                 logger.error(f"Error sending response to WebSocket: {e}. Forcing reconnect.")
                 raise websockets.exceptions.ConnectionClosed(None, f"WebSocket send error: {e}")
-                
+
     except asyncio.CancelledError:
         logger.info("Response queue processor cancelled")
         raise
@@ -710,7 +1037,15 @@ async def pipe_streamable_http(websocket, session, base_url):
                                         if json_data.get('code') == 4004:
                                             await websocket.close(code=4004, reason=str(json_data['error']))
                                             return
-                                            
+
+                                    # 检查是否为工具响应并应用截断
+                                    if is_tool_response(json_data):
+                                        full_data = truncate_tool_response(full_data)
+                                        if tool_result_limit == 0:
+                                            logger.info(f"SHTTP: Tool response processed (truncation disabled)")
+                                        else:
+                                            logger.info(f"SHTTP: Tool response truncated (limit: {tool_result_limit} bytes)")
+
                                     await response_queue.add(full_data)
                                 except json.JSONDecodeError:
                                     await response_queue.add(full_data)
@@ -775,7 +1110,7 @@ async def pipe_streamable_http(websocket, session, base_url):
         request_handler_task = asyncio.create_task(handle_requests())
         request_processor_task = asyncio.create_task(process_requests(endpoint))
         
-        done, pending = await asyncio.wait(
+        done, _pending = await asyncio.wait(
             [request_handler_task, request_processor_task],
             return_when=asyncio.FIRST_COMPLETED,
         )
@@ -894,9 +1229,6 @@ async def send_heartbeat(session, endpoint, session_id_or_callable=None):
                 async with session.post(endpoint, data=data, headers=current_headers) as response:
                     if response.status in [200, 202]:
                         logger.debug(f"Heartbeat successful: {response.status}")
-                        # Heartbeat should not be authoritative for changing session_id.
-                        # Session ID updates should come from the main request/response flow
-                        # or initialization. So, we don't update session_id from heartbeat response here.
                     else:
                         response_text = await response.text()
                         logger.warning(f"Heartbeat failed: {response.status} - {response_text}")
@@ -914,9 +1246,6 @@ async def send_heartbeat(session, endpoint, session_id_or_callable=None):
                 raise
             except Exception as e:
                 logger.warning(f"Generic error sending heartbeat: {e}")
-                # Avoid crashing the heartbeat loop for non-fatal errors, but log them.
-                # If the error implies a closed connection (e.g., from response.status == 4004 logic),
-                # it should be re-raised to be caught by the main connection handler.
 
     except asyncio.CancelledError:
         logger.info(f"Heartbeat task to {endpoint} cancelled")
@@ -948,15 +1277,25 @@ async def websocket_heartbeat(websocket):
 
 def load_config(config_file):
     """Load configuration from a YAML file"""
+    global tool_result_limit
     try:
         with open(config_file, 'r', encoding='utf-8') as f:
             config = yaml.safe_load(f)
+
+        # 加载工具响应限制设置
+        if config and 'tool_result_limit' in config:
+            tool_result_limit = config['tool_result_limit']
+            if tool_result_limit == 0:
+                logger.info("工具响应限制已禁用（不截断）")
+            else:
+                logger.info(f"工具响应限制设置为: {tool_result_limit} 字节")
+
         return config
     except Exception as e:
         logger.error(f"Error loading config file: {e}")
         return None
 
-def signal_handler(sig, frame):
+def signal_handler(_sig, _frame):
     """Handle interrupt signals"""
     logger.info("Received interrupt signal, shutting down...")
     sys.exit(0)
